@@ -144,54 +144,104 @@ def collect_loop():
             except Exception:
                 device_map = {}
             # Some versions of `pyemvue.enums.Unit` may not expose `WATTS`.
-            # Try common fallbacks and call the API without `unit` if none found.
+            # Try common fallbacks and use KWH if available (to match old code style).
             unit_const = None
-            for candidate in ("WATTS", "WATT", "W"):
+            for candidate in ("KWH", "WATTS", "WATT", "W"):
                 if hasattr(Unit, candidate):
                     unit_const = getattr(Unit, candidate)
                     logging.debug("Using Unit.%s for usage calls", candidate)
                     break
 
-            usage_kwargs = {
-                "deviceGids": gids,
-                "instant": None,
-                "scale": Scale.MINUTE,
-            }
-            if unit_const is not None:
-                usage_kwargs["unit"] = unit_const
+            # Update device metadata and collect per-device usage, including subpanels and nested circuits.
+            for device in device_map.values():
+                try:
+                    # Populate location/name metadata if available
+                    vue.populate_device_properties(device)
+                except Exception:
+                    logging.debug("Unable to populate properties for device %s", getattr(device, "device_gid", "?"), exc_info=True)
 
-            logging.debug("Fetching usage for gids=%s", gids)
-            usage = {}
-            try:
-                usage_result = vue.get_device_list_usage(**usage_kwargs)
+                device_gid = getattr(device, "device_gid", None) or getattr(device, "gid", None)
+                if not device_gid:
+                    continue
+
+                device_name = (
+                    str(getattr(device, "device_name", ""))
+                    or str(getattr(device, "display_name", ""))
+                    or f"device_{device_gid}"
+                )
+
+                try:
+                    usage_result = vue.get_device_list_usage(
+                        deviceGids=[device_gid],
+                        instant=None,
+                        scale=Scale.MINUTE,
+                        **({"unit": unit_const} if unit_const is not None else {}),
+                    )
+                except Exception:
+                    logging.exception("Failed to fetch usage for device %s", device_gid)
+                    continue
+
+                # Normalize usage result to dictionary by gid
+                usage_dict = {}
                 if isinstance(usage_result, dict):
-                    usage = usage_result
+                    usage_dict = usage_result
                 elif isinstance(usage_result, list):
-                    usage = {int(getattr(dev, "device_gid", 0)): dev for dev in usage_result}
+                    for u in usage_result:
+                        key = int(getattr(u, "device_gid", 0) or 0)
+                        if key:
+                            usage_dict[key] = u
                 else:
-                    usage = {}
-                logging.debug("Initial usage keys=%s", list(usage.keys()))
-            except Exception:
-                logging.exception("Failed initial usage query")
-                usage = {}
+                    continue
 
-            # ensure we have all devices; some API versions only return one set when using all gids
-            missing = [g for g in gids if int(g) not in usage]
-            if missing:
-                logging.debug("Missing usage for gids=%s, fetching individually", missing)
-                for missing_gid in missing:
-                    try:
-                        one_usage = vue.get_device_list_usage(
-                            deviceGids=[missing_gid], instant=None, scale=Scale.MINUTE, **({"unit": unit_const} if unit_const is not None else {})
-                        )
-                        if isinstance(one_usage, dict):
-                            usage.update(one_usage)
-                        elif isinstance(one_usage, list):
-                            for dev in one_usage:
-                                usage[int(getattr(dev, "device_gid", 0))] = dev
-                    except Exception:
-                        logging.exception("Failed usage query for gid %s", missing_gid)
-            logging.debug("Final usage keys=%s", list(usage.keys()))
+                usage_device = usage_dict.get(int(device_gid))
+                if not usage_device:
+                    continue
+
+                # Per device circuit power
+                total_power = 0.0
+                channels = getattr(usage_device, "channels", {}) or {}
+                for ch_num, ch in channels.items():
+                    if ch is None:
+                        continue
+                    ch_name = str(getattr(ch, "name", ch_num))
+                    ch_usage = getattr(ch, "usage", None)
+                    if ch_usage is None:
+                        continue
+                    ch_u = float(ch_usage)
+                    total_power += ch_u
+
+                    CHANNEL_POWER_WATTS.labels(
+                        device_gid=str(device_gid),
+                        device_name=device_name,
+                        channel_num=str(ch_num),
+                        channel_name=ch_name,
+                    ).set(ch_u)
+
+                DEVICE_POWER_WATTS.labels(
+                    device_gid=str(device_gid),
+                    device_name=device_name,
+                ).set(total_power)
+
+                # Static metadata metrics
+                try:
+                    DEVICE_INFO.labels(
+                        device_gid=str(device_gid),
+                        device_name=device_name,
+                        display_name=str(getattr(device, "display_name", "")),
+                        model=str(getattr(device, "model", "")),
+                        firmware=str(getattr(device, "firmware", "")),
+                        manufacturer_id=str(getattr(device, "manufacturer_id", "")),
+                        zip_code=str(getattr(device, "zip_code", "")),
+                        time_zone=str(getattr(device, "time_zone", "")),
+                        solar=str(getattr(device, "solar", "")),
+                    ).set(1)
+                except Exception:
+                    logging.debug("Failed to set DEVICE_INFO for %s", device_gid, exc_info=True)
+
+                DEVICE_CONNECTED.labels(
+                    device_gid=str(device_gid),
+                    device_name=device_name,
+                ).set(1 if getattr(device, "connected", False) else 0)
 
             # Export channel types
             try:
@@ -250,137 +300,7 @@ def collect_loop():
             except Exception:
                 logging.debug("Failed to fetch outlets/chargers", exc_info=True)
 
-            # Recursively process usage data to export all circuits (channels)
-            def process_usage_device(dev):
-                try:
-                    dg = int(getattr(dev, "device_gid", 0) or 0)
-                except Exception:
-                    dg = 0
-                mapped_dev = device_map.get(dg)
-                device_name = (
-                    str(getattr(mapped_dev, "device_name", ""))
-                    if mapped_dev and getattr(mapped_dev, "device_name", "")
-                    else str(getattr(dev, "device_name", "unknown"))
-                )
-
-                total = 0.0
-                channels = getattr(dev, "channels", {}) or {}
-                # channels is a dict of channel_num -> VueDeviceChannelUsage
-                for channel_num, channel in channels.items():
-                    try:
-                        channel_usage = getattr(channel, "usage", None)
-                        usage_val = float(channel_usage) if channel_usage is not None else None
-                    except Exception:
-                        usage_val = None
-
-                    channel_name = str(getattr(channel, "name", channel_num))
-                    if usage_val is not None:
-                        total += usage_val
-                        CHANNEL_POWER_WATTS.labels(
-                            device_gid=str(dg),
-                            device_name=device_name,
-                            channel_num=str(channel_num),
-                            channel_name=channel_name,
-                        ).set(usage_val)
-
-                    # handle nested devices attached to this channel
-                    nested = getattr(channel, "nested_devices", {}) or {}
-                    for _, nested_dev in (nested.items() if hasattr(nested, "items") else enumerate(nested)):
-                        # nested_dev is a VueUsageDevice
-                        nested_total = process_usage_device(nested_dev)
-                        # Do not double-count nested usage into parent total here; nested devices are separate devices
-
-                # Set device-level metric for this device
-                try:
-                    DEVICE_POWER_WATTS.labels(
-                        device_gid=str(dg),
-                        device_name=device_name,
-                    ).set(total)
-                except Exception:
-                    logging.debug("Failed to set DEVICE_POWER_WATTS for %s", dg, exc_info=True)
-
-                # Also export static info if available
-                if mapped_dev:
-                    try:
-                        DEVICE_INFO.labels(
-                            device_gid=str(getattr(mapped_dev, "device_gid", "")),
-                            device_name=str(getattr(mapped_dev, "device_name", "")),
-                            display_name=str(getattr(mapped_dev, "display_name", "")),
-                            model=str(getattr(mapped_dev, "model", "")),
-                            firmware=str(getattr(mapped_dev, "firmware", "")),
-                            manufacturer_id=str(getattr(mapped_dev, "manufacturer_id", "")),
-                            zip_code=str(getattr(mapped_dev, "zip_code", "")),
-                            time_zone=str(getattr(mapped_dev, "time_zone", "")),
-                            solar=str(getattr(mapped_dev, "solar", "")),
-                        ).set(1)
-                    except Exception:
-                        logging.debug("Failed to set DEVICE_INFO for %s", mapped_dev, exc_info=True)
-                    DEVICE_CONNECTED.labels(
-                        device_gid=str(getattr(mapped_dev, "device_gid", "")),
-                        device_name=str(getattr(mapped_dev, "device_name", "")),
-                    ).set(1 if getattr(mapped_dev, "connected", False) else 0)
-
-                return total
-
-            for _, device in usage.items():
-                try:
-                    process_usage_device(device)
-                except Exception:
-                    logging.debug("Failed to process usage for device %s", getattr(device, "device_gid", "?"), exc_info=True)
-
-            # Ensure all known devices (including subpanels) are reflected by iterating the device list from get_devices.
-            for device in device_map.values():
-                dg = int(getattr(device, "device_gid", 0) or 0)
-                dn = str(getattr(device, "device_name", "unknown"))
-                # If we already imported usage values, skip setting 0 and keep actual numbers.
-                if dg in usage:
-                    continue
-
-                total = 0.0
-                usg_device = usage.get(dg)
-                for channel in getattr(device, "channels", []):
-                    ch_num = str(getattr(channel, "channel_num", ""))
-                    ch_name = str(getattr(channel, "name", ""))
-
-                    usage_val = 0.0
-                    if usg_device:
-                        # if subpanel is in usage, override with actual value
-                        usg_channel = getattr(usg_device, "channels", {}).get(ch_num)
-                        if usg_channel is not None:
-                            usage_val = float(getattr(usg_channel, "usage", 0.0) or 0.0)
-
-                    CHANNEL_POWER_WATTS.labels(
-                        device_gid=str(dg),
-                        device_name=dn,
-                        channel_num=ch_num,
-                        channel_name=ch_name,
-                    ).set(float(usage_val))
-                    total += usage_val
-
-                DEVICE_POWER_WATTS.labels(
-                    device_gid=str(dg),
-                    device_name=dn,
-                ).set(float(total))
-
-                # ensure device metadata is in output as well
-                try:
-                    DEVICE_INFO.labels(
-                        device_gid=str(getattr(device, "device_gid", "")),
-                        device_name=str(getattr(device, "device_name", "")),
-                        display_name=str(getattr(device, "display_name", "")),
-                        model=str(getattr(device, "model", "")),
-                        firmware=str(getattr(device, "firmware", "")),
-                        manufacturer_id=str(getattr(device, "manufacturer_id", "")),
-                        zip_code=str(getattr(device, "zip_code", "")),
-                        time_zone=str(getattr(device, "time_zone", "")),
-                        solar=str(getattr(device, "solar", "")),
-                    ).set(1)
-                except Exception:
-                    logging.debug("Failed to set DEVICE_INFO for %s", device, exc_info=True)
-                DEVICE_CONNECTED.labels(
-                    device_gid=str(getattr(device, "device_gid", "")),
-                    device_name=str(getattr(device, "device_name", "")),
-                ).set(1 if getattr(device, "connected", False) else 0)
+            # Per-device usage and metrics already emitted above, so no extra recursive pass is needed.
 
             EXPORTER_UP.set(1)
             LAST_SUCCESS.set(time.time())
