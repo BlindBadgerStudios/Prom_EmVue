@@ -160,7 +160,38 @@ def collect_loop():
             if unit_const is not None:
                 usage_kwargs["unit"] = unit_const
 
-            usage = vue.get_device_list_usage(**usage_kwargs)
+            logging.debug("Fetching usage for gids=%s", gids)
+            usage = {}
+            try:
+                usage_result = vue.get_device_list_usage(**usage_kwargs)
+                if isinstance(usage_result, dict):
+                    usage = usage_result
+                elif isinstance(usage_result, list):
+                    usage = {int(getattr(dev, "device_gid", 0)): dev for dev in usage_result}
+                else:
+                    usage = {}
+                logging.debug("Initial usage keys=%s", list(usage.keys()))
+            except Exception:
+                logging.exception("Failed initial usage query")
+                usage = {}
+
+            # ensure we have all devices; some API versions only return one set when using all gids
+            missing = [g for g in gids if int(g) not in usage]
+            if missing:
+                logging.debug("Missing usage for gids=%s, fetching individually", missing)
+                for missing_gid in missing:
+                    try:
+                        one_usage = vue.get_device_list_usage(
+                            deviceGids=[missing_gid], instant=None, scale=Scale.MINUTE, **({"unit": unit_const} if unit_const is not None else {})
+                        )
+                        if isinstance(one_usage, dict):
+                            usage.update(one_usage)
+                        elif isinstance(one_usage, list):
+                            for dev in one_usage:
+                                usage[int(getattr(dev, "device_gid", 0))] = dev
+                    except Exception:
+                        logging.exception("Failed usage query for gid %s", missing_gid)
+            logging.debug("Final usage keys=%s", list(usage.keys()))
 
             # Export channel types
             try:
