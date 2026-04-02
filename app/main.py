@@ -72,12 +72,24 @@ def collect_loop():
                 )
                 if gid:
                     gids.append(gid)
-            usage = vue.get_device_list_usage(
-                deviceGids=gids,
-                instant=None,
-                scale=Scale.MINUTE,
-                unit=Unit.WATTS,
-            )
+            # Some versions of `pyemvue.enums.Unit` may not expose `WATTS`.
+            # Try common fallbacks and call the API without `unit` if none found.
+            unit_const = None
+            for candidate in ("WATTS", "WATT", "W"):
+                if hasattr(Unit, candidate):
+                    unit_const = getattr(Unit, candidate)
+                    logging.debug("Using Unit.%s for usage calls", candidate)
+                    break
+
+            usage_kwargs = {
+                "deviceGids": gids,
+                "instant": None,
+                "scale": Scale.MINUTE,
+            }
+            if unit_const is not None:
+                usage_kwargs["unit"] = unit_const
+
+            usage = vue.get_device_list_usage(**usage_kwargs)
 
             for _, device in usage.items():
                 device_gid = str(getattr(device, "device_gid", "unknown"))
