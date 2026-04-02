@@ -328,6 +328,60 @@ def collect_loop():
                 except Exception:
                     logging.debug("Failed to process usage for device %s", getattr(device, "device_gid", "?"), exc_info=True)
 
+            # Ensure all known devices (including subpanels) are reflected by iterating the device list from get_devices.
+            for device in device_map.values():
+                dg = int(getattr(device, "device_gid", 0) or 0)
+                dn = str(getattr(device, "device_name", "unknown"))
+                # If we already imported usage values, skip setting 0 and keep actual numbers.
+                if dg in usage:
+                    continue
+
+                total = 0.0
+                usg_device = usage.get(dg)
+                for channel in getattr(device, "channels", []):
+                    ch_num = str(getattr(channel, "channel_num", ""))
+                    ch_name = str(getattr(channel, "name", ""))
+
+                    usage_val = 0.0
+                    if usg_device:
+                        # if subpanel is in usage, override with actual value
+                        usg_channel = getattr(usg_device, "channels", {}).get(ch_num)
+                        if usg_channel is not None:
+                            usage_val = float(getattr(usg_channel, "usage", 0.0) or 0.0)
+
+                    CHANNEL_POWER_WATTS.labels(
+                        device_gid=str(dg),
+                        device_name=dn,
+                        channel_num=ch_num,
+                        channel_name=ch_name,
+                    ).set(float(usage_val))
+                    total += usage_val
+
+                DEVICE_POWER_WATTS.labels(
+                    device_gid=str(dg),
+                    device_name=dn,
+                ).set(float(total))
+
+                # ensure device metadata is in output as well
+                try:
+                    DEVICE_INFO.labels(
+                        device_gid=str(getattr(device, "device_gid", "")),
+                        device_name=str(getattr(device, "device_name", "")),
+                        display_name=str(getattr(device, "display_name", "")),
+                        model=str(getattr(device, "model", "")),
+                        firmware=str(getattr(device, "firmware", "")),
+                        manufacturer_id=str(getattr(device, "manufacturer_id", "")),
+                        zip_code=str(getattr(device, "zip_code", "")),
+                        time_zone=str(getattr(device, "time_zone", "")),
+                        solar=str(getattr(device, "solar", "")),
+                    ).set(1)
+                except Exception:
+                    logging.debug("Failed to set DEVICE_INFO for %s", device, exc_info=True)
+                DEVICE_CONNECTED.labels(
+                    device_gid=str(getattr(device, "device_gid", "")),
+                    device_name=str(getattr(device, "device_name", "")),
+                ).set(1 if getattr(device, "connected", False) else 0)
+
             EXPORTER_UP.set(1)
             LAST_SUCCESS.set(time.time())
 
