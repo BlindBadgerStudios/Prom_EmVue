@@ -1,0 +1,20 @@
+services:
+  prom_emvue:
+    image: blindbadgerstudios/prom_emvue:latest
+    container_name: prom_emvue
+    restart: unless-stopped
+    ports:
+      - "10110:10110"
+    environment:
+      EMPORIA_USERNAME: "${EMPORIA_USERNAME}"
+      EMPORIA_PASSWORD: "${EMPORIA_PASSWORD}"
+      POLL_INTERVAL_SECONDS: "60"
+      LISTEN_PORT: "10110"
+      LOG_LEVEL: "INFO"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
