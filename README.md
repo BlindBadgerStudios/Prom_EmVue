@@ -22,7 +22,10 @@ Add the following to your `prometheus.yml`:
 
 ## Docker Compose configuration notes
 
-In `docker-compose.yml`, the exporter service is configured with:
+Use `docker-compose.yml` when you want to self-build the exporter image from source (local build context).
+Use `compose.yml` when you want to deploy the pre-built Docker Hub image (no local build required).
+
+In either compose file, the exporter service is configured with:
 
 - `EMPORIA_USERNAME` and `EMPORIA_PASSWORD` environment variables (required)
 - `POLL_INTERVAL_SECONDS` default `60` (controls polling cadence)
