@@ -52,7 +52,26 @@ def collect_loop():
             vue.login(username=USERNAME, password=PASSWORD, token_storage_file=None)
 
             devices = vue.get_devices()
-            gids = [device.device_gid for device in devices.values()]
+            # `vue.get_devices()` may return a dict or a list depending on
+            # library version. Support either shape and defensively extract
+            # device GIDs.
+            if isinstance(devices, dict):
+                device_iter = devices.values()
+            elif isinstance(devices, list):
+                device_iter = devices
+            else:
+                try:
+                    device_iter = list(devices)
+                except Exception:
+                    device_iter = []
+
+            gids = []
+            for device in device_iter:
+                gid = getattr(device, "device_gid", None) or getattr(
+                    device, "gid", None
+                )
+                if gid:
+                    gids.append(gid)
             usage = vue.get_device_list_usage(
                 deviceGids=gids,
                 instant=None,
