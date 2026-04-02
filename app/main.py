@@ -17,296 +17,204 @@ LISTEN_PORT = int(os.getenv("LISTEN_PORT", "10110"))
 USERNAME = os.getenv("EMPORIA_USERNAME")
 PASSWORD = os.getenv("EMPORIA_PASSWORD")
 
+# --- Exporter health metrics ---
 EXPORTER_UP = Gauge("emporia_exporter_up", "1 if the last poll succeeded")
-LAST_SUCCESS = Gauge(
-    "emporia_exporter_last_success_timestamp_seconds",
-    "Unix timestamp of last successful poll",
-)
-POLL_DURATION = Gauge(
-    "emporia_exporter_poll_duration_seconds",
-    "Duration of the last poll",
-)
-ERRORS_TOTAL = Counter(
-    "emporia_exporter_errors_total",
-    "Total Emporia polling errors",
-)
+LAST_SUCCESS = Gauge("emporia_exporter_last_success_timestamp_seconds", "Unix timestamp of last successful poll")
+POLL_DURATION = Gauge("emporia_exporter_poll_duration_seconds", "Duration of the last poll in seconds")
+ERRORS_TOTAL = Counter("emporia_exporter_errors_total", "Total Emporia polling errors")
 
+# --- Energy metrics ---
 DEVICE_POWER_WATTS = Gauge(
-    "emporia_device_power_watts",
-    "Current device power",
+    "emporia_device_power_watts", "Estimated current device power in watts",
     ["device_gid", "device_name"],
 )
-
 CHANNEL_POWER_WATTS = Gauge(
-    "emporia_channel_power_watts",
-    "Current channel power",
+    "emporia_channel_power_watts", "Estimated current channel power in watts",
     ["device_gid", "device_name", "channel_num", "channel_name"],
 )
 
-# Additional metrics
+# --- Device metadata ---
 DEVICE_INFO = Gauge(
-    "emporia_device_info",
-    "Static device info (value is always 1)",
-    [
-        "device_gid",
-        "device_name",
-        "display_name",
-        "model",
-        "firmware",
-        "manufacturer_id",
-        "zip_code",
-        "time_zone",
-        "solar",
-    ],
+    "emporia_device_info", "Static device info (value always 1)",
+    ["device_gid", "device_name", "model", "firmware", "zip_code", "time_zone"],
 )
-
 DEVICE_CONNECTED = Gauge(
-    "emporia_device_connected",
-    "1 if device currently connected",
+    "emporia_device_connected", "1 if device is connected",
     ["device_gid", "device_name"],
 )
 
-OUTLET_ON = Gauge(
-    "emporia_outlet_on",
-    "1 if an outlet is on",
-    ["device_gid", "load_gid"],
-)
+# --- Outlets and chargers ---
+OUTLET_ON = Gauge("emporia_outlet_on", "1 if outlet is on", ["device_gid", "load_gid"])
+CHARGER_ON = Gauge("emporia_charger_on", "1 if charger is on", ["device_gid", "load_gid"])
+CHARGER_RATE = Gauge("emporia_charger_charging_rate_amps", "Charger rate in amps", ["device_gid", "load_gid"])
 
-CHARGER_ON = Gauge(
-    "emporia_charger_on",
-    "1 if a charger is on",
-    ["device_gid", "load_gid"],
-)
-
-CHARGER_CHARGING_RATE = Gauge(
-    "emporia_charger_charging_rate",
-    "Current charger charging rate",
-    ["device_gid", "load_gid"],
-)
-
-CHANNEL_TYPE_INFO = Gauge(
-    "emporia_channel_type_info",
-    "Channel type metadata (value is always 1)",
-    ["channel_type_gid", "description", "selectable"],
-)
-
+# --- Vehicles ---
 VEHICLE_INFO = Gauge(
-    "emporia_vehicle_info",
-    "Vehicle static info (value is always 1)",
-    ["vehicle_gid", "display_name", "vendor", "make", "model", "year"],
+    "emporia_vehicle_info", "Vehicle static info (value always 1)",
+    ["vehicle_gid", "display_name", "make", "model", "year"],
 )
-
-VEHICLE_STATUS = Gauge(
-    "emporia_vehicle_status",
-    "Vehicle runtime status metrics",
+VEHICLE_BATTERY = Gauge(
+    "emporia_vehicle_battery_level_percent", "Vehicle battery level",
     ["vehicle_gid", "display_name", "charging_state"],
 )
 
 
-def collect_loop():
+def kwh_per_min_to_watts(kwh):
+    """Convert kWh (over 1 minute sample) to average watts."""
+    return kwh * 60 * 1000
+
+
+def walk_usage(usage_dict, device_info, parent_gid=None, parent_name=None):
+    """
+    Recursively walk usage_dict (which may contain nested_devices on channels)
+    and emit CHANNEL_POWER_WATTS and DEVICE_POWER_WATTS metrics.
+    """
+    for gid, usage_device in usage_dict.items():
+        gid = int(gid)
+        info = device_info.get(gid)
+        device_name = (
+            (info.device_name if info else None)
+            or parent_name
+            or f"device_{gid}"
+        )
+
+        total_watts = 0.0
+        channels = getattr(usage_device, "channels", {}) or {}
+
+        for ch_num, ch in channels.items():
+            if ch is None:
+                continue
+            raw = getattr(ch, "usage", None)
+            if raw is None:
+                continue
+            watts = kwh_per_min_to_watts(float(raw))
+            total_watts += watts
+            ch_name = str(getattr(ch, "name", ch_num) or ch_num)
+
+            CHANNEL_POWER_WATTS.labels(
+                device_gid=str(gid),
+                device_name=device_name,
+                channel_num=str(ch_num),
+                channel_name=ch_name,
+            ).set(watts)
+
+            # Recurse into nested devices (subpanels, smart plugs on circuit)
+            nested = getattr(ch, "nested_devices", None)
+            if nested:
+                walk_usage(nested, device_info, parent_gid=gid, parent_name=device_name)
+
+        DEVICE_POWER_WATTS.labels(
+            device_gid=str(gid),
+            device_name=device_name,
+        ).set(total_watts)
+
+
+def collect_loop(vue: PyEmVue):
     while True:
         start = time.time()
         try:
-            vue = PyEmVue()
-            vue.login(username=USERNAME, password=PASSWORD, token_storage_file=None)
-
+            # get_devices() returns a list of VueDevice objects
             devices = vue.get_devices()
-            # `vue.get_devices()` may return a dict or a list depending on
-            # library version. Support either shape and defensively extract
-            # device GIDs.
-            if isinstance(devices, dict):
-                device_iter = devices.values()
-            elif isinstance(devices, list):
-                device_iter = devices
-            else:
+
+            device_info = {}
+            device_gids = []
+            for device in devices:
+                gid = device.device_gid
+                if gid not in device_gids:
+                    device_gids.append(gid)
+                # Merge channels if the same GID appears more than once
+                if gid in device_info:
+                    device_info[gid].channels += device.channels
+                else:
+                    device_info[gid] = device
+
+            # Populate name/location properties for each device
+            for gid, device in device_info.items():
                 try:
-                    device_iter = list(devices)
-                except Exception:
-                    device_iter = []
-
-            gids = []
-            for device in device_iter:
-                gid = getattr(device, "device_gid", None) or getattr(
-                    device, "gid", None
-                )
-                if gid:
-                    gids.append(gid)
-
-            # Build a device map from the device list so we can export static
-            # info and connectivity status. The public pyemvue API returns
-            # a list of `VueDevice` objects from `get_devices()`.
-            device_map = {}
-            try:
-                for d in device_iter:
-                    dg = getattr(d, "device_gid", None) or getattr(d, "gid", None)
-                    if dg:
-                        device_map[int(dg)] = d
-            except Exception:
-                device_map = {}
-            # Some versions of `pyemvue.enums.Unit` may not expose `WATTS`.
-            # Try common fallbacks and use KWH if available (to match old code style).
-            unit_const = None
-            for candidate in ("KWH", "WATTS", "WATT", "W"):
-                if hasattr(Unit, candidate):
-                    unit_const = getattr(Unit, candidate)
-                    logging.debug("Using Unit.%s for usage calls", candidate)
-                    break
-
-            # Update device metadata and collect per-device usage, including subpanels and nested circuits.
-            for device in device_map.values():
-                try:
-                    # Populate location/name metadata if available
                     vue.populate_device_properties(device)
                 except Exception:
-                    logging.debug("Unable to populate properties for device %s", getattr(device, "device_gid", "?"), exc_info=True)
+                    logging.debug("Could not populate properties for %s", gid, exc_info=True)
 
-                device_gid = getattr(device, "device_gid", None) or getattr(device, "gid", None)
-                if not device_gid:
-                    continue
+                device_name = device.device_name or f"device_{gid}"
 
-                device_name = (
-                    str(getattr(device, "device_name", ""))
-                    or str(getattr(device, "display_name", ""))
-                    or f"device_{device_gid}"
-                )
-
-                try:
-                    usage_result = vue.get_device_list_usage(
-                        deviceGids=[device_gid],
-                        instant=None,
-                        scale=Scale.MINUTE,
-                        **({"unit": unit_const} if unit_const is not None else {}),
-                    )
-                except Exception:
-                    logging.exception("Failed to fetch usage for device %s", device_gid)
-                    continue
-
-                # Normalize usage result to dictionary by gid
-                usage_dict = {}
-                if isinstance(usage_result, dict):
-                    usage_dict = usage_result
-                elif isinstance(usage_result, list):
-                    for u in usage_result:
-                        key = int(getattr(u, "device_gid", 0) or 0)
-                        if key:
-                            usage_dict[key] = u
-                else:
-                    continue
-
-                usage_device = usage_dict.get(int(device_gid))
-                if not usage_device:
-                    continue
-
-                # Per device circuit power
-                total_power = 0.0
-                channels = getattr(usage_device, "channels", {}) or {}
-                for ch_num, ch in channels.items():
-                    if ch is None:
-                        continue
-                    ch_name = str(getattr(ch, "name", ch_num))
-                    ch_usage = getattr(ch, "usage", None)
-                    if ch_usage is None:
-                        continue
-                    ch_u = float(ch_usage)
-                    total_power += ch_u
-
-                    CHANNEL_POWER_WATTS.labels(
-                        device_gid=str(device_gid),
-                        device_name=device_name,
-                        channel_num=str(ch_num),
-                        channel_name=ch_name,
-                    ).set(ch_u)
-
-                DEVICE_POWER_WATTS.labels(
-                    device_gid=str(device_gid),
-                    device_name=device_name,
-                ).set(total_power)
-
-                # Static metadata metrics
                 try:
                     DEVICE_INFO.labels(
-                        device_gid=str(device_gid),
+                        device_gid=str(gid),
                         device_name=device_name,
-                        display_name=str(getattr(device, "display_name", "")),
                         model=str(getattr(device, "model", "")),
                         firmware=str(getattr(device, "firmware", "")),
-                        manufacturer_id=str(getattr(device, "manufacturer_id", "")),
                         zip_code=str(getattr(device, "zip_code", "")),
                         time_zone=str(getattr(device, "time_zone", "")),
-                        solar=str(getattr(device, "solar", "")),
                     ).set(1)
                 except Exception:
-                    logging.debug("Failed to set DEVICE_INFO for %s", device_gid, exc_info=True)
+                    logging.debug("Could not set DEVICE_INFO for %s", gid, exc_info=True)
 
                 DEVICE_CONNECTED.labels(
-                    device_gid=str(device_gid),
+                    device_gid=str(gid),
                     device_name=device_name,
                 ).set(1 if getattr(device, "connected", False) else 0)
 
-            # Export channel types
-            try:
-                channel_types = vue.get_channel_types()
-                for ct in channel_types:
-                    CHANNEL_TYPE_INFO.labels(
-                        channel_type_gid=str(getattr(ct, "channel_type_gid", "")),
-                        description=str(getattr(ct, "description", "")),
-                        selectable=str(getattr(ct, "selectable", "")),
-                    ).set(1)
-            except Exception:
-                logging.debug("Failed to fetch channel types", exc_info=True)
+            # Fetch usage for all devices in one call
+            usage_dict = vue.get_device_list_usage(
+                deviceGids=device_gids,
+                instant=None,
+                scale=Scale.MINUTE.value,
+                unit=Unit.KWH.value,
+            )
 
-            # Export vehicles and their status
+            # Walk usage recursively (handles subpanels / nested devices)
+            walk_usage(usage_dict, device_info)
+
+            # Outlets
             try:
-                vehicles = vue.get_vehicles()
-                for v in vehicles:
+                for outlet in vue.get_outlets():
+                    OUTLET_ON.labels(
+                        device_gid=str(outlet.device_gid),
+                        load_gid=str(outlet.load_gid),
+                    ).set(1 if outlet.outlet_on else 0)
+            except Exception:
+                logging.debug("Could not fetch outlets", exc_info=True)
+
+            # EV Chargers
+            try:
+                for charger in vue.get_chargers():
+                    labels = dict(device_gid=str(charger.device_gid), load_gid=str(charger.load_gid))
+                    CHARGER_ON.labels(**labels).set(1 if charger.charger_on else 0)
+                    CHARGER_RATE.labels(**labels).set(float(getattr(charger, "charging_rate", 0)))
+            except Exception:
+                logging.debug("Could not fetch chargers", exc_info=True)
+
+            # Vehicles
+            try:
+                for vehicle in vue.get_vehicles():
+                    vid = str(vehicle.vehicle_gid)
+                    dname = str(vehicle.display_name)
                     VEHICLE_INFO.labels(
-                        vehicle_gid=str(getattr(v, "vehicle_gid", "")),
-                        display_name=str(getattr(v, "display_name", "")),
-                        vendor=str(getattr(v, "vendor", "")),
-                        make=str(getattr(v, "make", "")),
-                        model=str(getattr(v, "model", "")),
-                        year=str(getattr(v, "year", "")),
+                        vehicle_gid=vid,
+                        display_name=dname,
+                        make=str(getattr(vehicle, "make", "")),
+                        model=str(getattr(vehicle, "model", "")),
+                        year=str(getattr(vehicle, "year", "")),
                     ).set(1)
                     try:
-                        vs = vue.get_vehicle_status(getattr(v, "vehicle_gid", 0))
+                        vs = vue.get_vehicle_status(vehicle)
                         if vs:
-                            VEHICLE_STATUS.labels(
-                                vehicle_gid=str(getattr(vs, "vehicle_gid", "")),
-                                display_name=str(getattr(v, "display_name", "")),
+                            VEHICLE_BATTERY.labels(
+                                vehicle_gid=vid,
+                                display_name=dname,
                                 charging_state=str(getattr(vs, "charging_state", "")),
                             ).set(float(getattr(vs, "battery_level", 0)))
                     except Exception:
-                        logging.debug("Failed to fetch vehicle status for %s", v, exc_info=True)
+                        logging.debug("Could not get vehicle status for %s", vid, exc_info=True)
             except Exception:
-                logging.debug("Failed to fetch vehicles", exc_info=True)
-
-            # Export outlets/chargers and connectivity
-            try:
-                outlets, chargers = vue.get_devices_status(device_list=list(device_map.values()) if device_map else None)
-                for outlet in (outlets or []):
-                    OUTLET_ON.labels(
-                        device_gid=str(getattr(outlet, "device_gid", "")),
-                        load_gid=str(getattr(outlet, "load_gid", "")),
-                    ).set(1 if getattr(outlet, "outlet_on", False) else 0)
-                for charger in (chargers or []):
-                    CHARGER_ON.labels(
-                        device_gid=str(getattr(charger, "device_gid", "")),
-                        load_gid=str(getattr(charger, "load_gid", "")),
-                    ).set(1 if getattr(charger, "charger_on", False) else 0)
-                    CHARGER_CHARGING_RATE.labels(
-                        device_gid=str(getattr(charger, "device_gid", "")),
-                        load_gid=str(getattr(charger, "load_gid", "")),
-                    ).set(float(getattr(charger, "charging_rate", 0)))
-            except Exception:
-                logging.debug("Failed to fetch outlets/chargers", exc_info=True)
-
-            # Per-device usage and metrics already emitted above, so no extra recursive pass is needed.
+                logging.debug("Could not fetch vehicles", exc_info=True)
 
             EXPORTER_UP.set(1)
             LAST_SUCCESS.set(time.time())
+            logging.info("Poll succeeded in %.1fs", time.time() - start)
 
         except Exception:
-            logging.exception("Polling failed")
+            logging.exception("Polling cycle failed")
             ERRORS_TOTAL.inc()
             EXPORTER_UP.set(0)
 
@@ -318,10 +226,16 @@ def collect_loop():
 
 def main():
     if not USERNAME or not PASSWORD:
-        raise RuntimeError("EMPORIA_USERNAME and EMPORIA_PASSWORD are required")
+        raise RuntimeError("EMPORIA_USERNAME and EMPORIA_PASSWORD must be set")
+
+    # Login once — token refresh is handled automatically by the library
+    vue = PyEmVue()
+    vue.login(username=USERNAME, password=PASSWORD, token_storage_file=None)
+    logging.info("Logged in to Emporia. Starting exporter on port %d", LISTEN_PORT)
 
     start_http_server(LISTEN_PORT)
-    thread = threading.Thread(target=collect_loop, daemon=True)
+
+    thread = threading.Thread(target=collect_loop, args=(vue,), daemon=True)
     thread.start()
 
     while True:
