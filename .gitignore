@@ -416,3 +416,10 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Secrets (secret-hygiene)
+.env
+.env.*
+secrets/
+*.pem
+*.key

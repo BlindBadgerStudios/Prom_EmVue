@@ -35,3 +35,12 @@ In either compose file, the exporter service is configured with:
 - `cap_drop: [ALL]` and `no-new-privileges: true` for security
 
 Adjust these values as needed for your deployment environment.
+
+## Secret scanning
+
+This repo uses a [gitleaks](https://github.com/gitleaks/gitleaks) pre-commit hook. After cloning, run:
+
+```sh
+pip install pre-commit  # or: uv tool install pre-commit
+pre-commit install
+```
