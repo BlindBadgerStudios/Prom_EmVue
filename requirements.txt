@@ -1,2 +1,3 @@
 pyemvue==0.18.9
 prometheus-client==0.26.0
+tzdata==2026.5
