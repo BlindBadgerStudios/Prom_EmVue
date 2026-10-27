@@ -1,2 +1,2 @@
 pyemvue==0.18.9
-prometheus-client==0.24.1
+prometheus-client==0.26.0
