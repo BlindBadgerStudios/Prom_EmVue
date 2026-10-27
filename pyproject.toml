@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prom-emvue"
+version = "0.2.0"
+description = "Prometheus exporter for Emporia Vue energy telemetry via PyEmVue"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "Blind Badger Studios" }
+]
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+pythonpath = ["."]
