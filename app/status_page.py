@@ -38,7 +38,7 @@ from app.status_rules import (
 EXPORTER_NAME = "prom_emvue"
 CONNECTION_MODE = "Emporia Vue cloud API"
 
-HINT_NOTES = (
+HINTS = (
     "401/403 → check API token/cred mount; do not paste into chat",
     "timeout → check docker3 outbound / upstream API",
     "429 → rate limit; backoff is intentional",
@@ -46,6 +46,37 @@ HINT_NOTES = (
     "zero/absent metrics in daylight with UP → upstream empty, not scrape down",
     "Do not restart-loop",
 )
+
+# Operator summary on the HTML page. Full precedence stays in status_rules.py.
+# A non-auth failure keeps DEGRADED past the hard age cutoff while the poll
+# thread is still backing off, so the DOWN clause does not copy prom_solark's
+# shorter line.
+STATE_RULE_LINE = (
+    "UP: last success within 2x poll interval and no hard auth failure. "
+    "DEGRADED: upstream 5xx/timeout (or other non-auth failure) with backoff while still polling. "
+    "DOWN: auth failure, or no success past the 15 minute hard age cutoff "
+    "when the process is not still backing off from a non-auth failure."
+)
+READ_ONLY_LINE = "Read-only. This page does not change the exporter."
+
+# Shared /status stylesheet, copied from prom_solark: fonts, colors, status
+# classes, grid, and section cards.
+STATUS_CSS = """\
+  body { font: 15px/1.45 -apple-system, "Segoe UI", sans-serif; margin: 2rem; color: #1b1b1b; background: #f6f5f2; }
+  h1 { font-size: 1.45rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1rem; margin: 0 0 0.5rem; }
+  .banner { background: #eef3f8; border: 1px solid #c5d4e4; padding: 0.75rem 1rem; margin: 1rem 0; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  section { background: #fff; border: 1px solid #ddd; padding: 0.75rem 1rem; }
+  dl { margin: 0; }
+  dt { color: #555; font-size: 0.85rem; }
+  dd { margin: 0 0 0.65rem; }
+  .UP { color: #0a7a32; font-weight: 700; }
+  .DEGRADED { color: #8a5a00; font-weight: 700; }
+  .DOWN { color: #a32020; font-weight: 700; }
+  .rule { color: #444; font-size: 0.9rem; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+"""
 
 
 def unknown_extras() -> dict:
@@ -301,8 +332,8 @@ def build_status(
 
 
 def _badge(phrase: str, overall: str) -> str:
-    css = {"UP": "up", "DEGRADED": "degraded", "DOWN": "down"}.get(overall, "down")
-    return f'<strong class="{css}">{escape(phrase)}</strong>'
+    css = overall if overall in {"UP", "DEGRADED", "DOWN"} else "DOWN"
+    return f'<span class="{css}">{escape(phrase)}</span>'
 
 
 def _time_cell(iso: str | None, pt: str | None, relative: str | None) -> str:
@@ -317,11 +348,22 @@ def _time_cell(iso: str | None, pt: str | None, relative: str | None) -> str:
     return " · ".join(parts) if parts else "n/a"
 
 
-def _rows(pairs: list[tuple[str, str]]) -> str:
-    body = []
+def _dl(pairs: list[tuple[str, str]]) -> str:
+    rows = []
     for label, value in pairs:
-        body.append(f"<tr><th>{escape(label)}</th><td>{value}</td></tr>")
-    return "<table>" + "".join(body) + "</table>"
+        rows.append(f"<dt>{escape(label)}</dt><dd>{value}</dd>")
+    return "<dl>" + "".join(rows) + "</dl>"
+
+
+def _code_and_message(code: str, message: str) -> str:
+    """Join a code and message without repeating a code the message already starts with."""
+    code = code.strip()
+    message = message.strip()
+    if not code:
+        return message or "n/a"
+    if message.lower().startswith(code.lower()):
+        return message
+    return f"{code} {message}".strip() or "n/a"
 
 
 def _device_summary(extras: dict) -> str:
@@ -360,7 +402,10 @@ def render_html(payload: dict) -> str:
     error = payload["last_error"]
     error_text = "None" if not error else f"{error.get('code') or ''} · {error.get('message') or ''}".strip(" ·")
     upstream = payload["upstream"]
-    upstream_text = f"{upstream.get('code') or ''} {upstream.get('message') or ''}".strip()
+    upstream_text = _code_and_message(
+        str(upstream.get("code") or ""),
+        str(upstream.get("message") or ""),
+    )
     version_bits = f"{payload['exporter']} {payload['version']}"
     if payload.get("build_sha"):
         version_bits += f" · {payload['build_sha']}"
@@ -377,8 +422,8 @@ def render_html(payload: dict) -> str:
         device_html = "<p>0 devices</p>"
     else:
         device_html = "<ul>" + "".join(device_items) + "</ul>"
-    notes = "".join(f"<li>{escape(note)}</li>" for note in HINT_NOTES)
-    overview = _rows(
+    hints = "".join(f"<li>{escape(note)}</li>" for note in HINTS)
+    overview = _dl(
         [
             ("Overall", _badge(payload["overall_phrase"], payload["overall"])),
             ("Exporter", escape(version_bits)),
@@ -396,19 +441,19 @@ def render_html(payload: dict) -> str:
                     else ""
                 ),
             ),
-            ("Upstream", escape(upstream_text or "n/a")),
+            ("Upstream", escape(upstream_text)),
             ("Failures", escape(failure_text)),
             ("Backoff", escape(str(payload["backoff"]))),
             ("Next retry", escape(payload["next_retry"])),
         ]
     )
-    error_table = _rows(
+    error_list = _dl(
         [
             ("Last error", escape(error_text)),
             ("Hint", escape(payload["hint"])),
         ]
     )
-    series = _rows(
+    series = _dl(
         [
             ("exporter_up", escape(str(payload["exporter_up"]))),
             ("Series", escape(_series_summary(payload))),
@@ -416,80 +461,52 @@ def render_html(payload: dict) -> str:
             ("Process", escape(payload["process"])),
         ]
     )
-    extra_table = _rows(
+    extra_list = _dl(
         [
             ("Devices", escape(_device_summary(extras))),
             ("Device count", escape("unknown" if extras.get("device_count") is None else str(extras["device_count"]))),
             ("Channels", escape(_channel_summary(extras))),
         ]
     )
-    known_html = f"<p class=\"note\">{escape(known)}</p>" if known else ""
-    return f"""<!DOCTYPE html>
+    known_html = f'<p class="rule">{escape(known)}</p>' if known else ""
+    sections = [
+        ("Overview", overview),
+        ("Error and hint", error_list),
+        ("Series and process", series),
+        ("Exporter extras", extra_list + device_html + known_html),
+    ]
+    blocks = "".join(
+        f"<section><h2>{escape(title)}</h2>{body}</section>" for title, body in sections
+    )
+    title = f"{escape(payload['exporter'])} · /status"
+    head = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>{escape(payload["exporter"])} /status</title>
+<title>{title}</title>
 <style>
-  :root {{ color-scheme: light; }}
-  body {{ margin: 0; font: 16px/1.45 "Segoe UI", Helvetica, Arial, sans-serif; color: #1c1c1c; background: #f6f5f2; }}
-  main {{ max-width: 980px; margin: 0 auto; padding: 1.5rem 1rem 3rem; }}
-  h1 {{ font-size: 1.5rem; margin: 0.4rem 0 0.2rem; }}
-  h2 {{ font-size: 1.05rem; margin: 0 0 0.6rem; }}
-  a {{ color: #0b4f8a; }}
-  .access {{ background: #e7eef5; border-left: 4px solid #0b4f8a; padding: 0.75rem 1rem; margin: 0; }}
-  .sub {{ color: #444; margin-top: 0; }}
-  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem; }}
-  section {{ background: #fff; border: 1px solid #ddd; padding: 0.9rem 1rem 1rem; }}
-  table {{ width: 100%; border-collapse: collapse; }}
-  th {{ text-align: left; vertical-align: top; width: 9rem; color: #444; font-weight: 600; padding: 0.28rem 0.6rem 0.28rem 0; }}
-  td {{ padding: 0.28rem 0; }}
-  .up {{ color: #146c2e; }}
-  .degraded {{ color: #8a5a00; }}
-  .down {{ color: #9b1c1c; }}
-  .note {{ color: #444; margin: 0.4rem 0 0; }}
-  ul {{ margin: 0.3rem 0 0; padding-left: 1.2rem; }}
-  @media (max-width: 720px) {{
-    .grid {{ grid-template-columns: 1fr; }}
-    th {{ width: 7.5rem; }}
-  }}
-</style>
+"""
+    tail = f"""</style>
 </head>
 <body>
-<main>
-  <p class="access">{escape(payload["access_note"])}</p>
-  <h1>{escape(payload["exporter"])} · /status</h1>
-  <p class="sub">{escape(version_bits)} · {escape(payload["mode"])} · read-only</p>
-  <p class="sub"><a href="/status?format=json">JSON</a> · <a href="/metrics">metrics</a></p>
+  <h1>{title}</h1>
+  <p class="banner">{escape(payload["access_note"])}</p>
+  <p class="rule">{escape(STATE_RULE_LINE)}</p>
+  <p class="rule"><a href="/status?format=json">JSON</a> · <a href="/metrics">metrics</a></p>
   <div class="grid">
-    <section>
-      <h2>Overview</h2>
-      {overview}
-    </section>
-    <section>
-      <h2>Error and hint</h2>
-      {error_table}
-    </section>
-    <section>
-      <h2>Series and process</h2>
-      {series}
-    </section>
-    <section>
-      <h2>Exporter extras</h2>
-      {extra_table}
-      {device_html}
-      {known_html}
-    </section>
+    {blocks}
   </div>
-  <section style="margin-top: 1rem;">
-    <h2>Notes</h2>
-    <ul>{notes}</ul>
+  <section>
+    <h2>Hints</h2>
+    <ul>{hints}</ul>
   </section>
-</main>
+  <p class="rule">{escape(READ_ONLY_LINE)}</p>
 </body>
 </html>
 """
+    return head + STATUS_CSS + tail
 
 
 def render_json(payload: dict) -> str:

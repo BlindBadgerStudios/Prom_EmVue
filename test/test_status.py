@@ -202,7 +202,74 @@ def test_package_version_matches_pyproject():
 
     text = Path("pyproject.toml").read_text()
     assert f'version = "{app.__version__}"' in text
-    assert app.__version__ == "0.2.1"
+    assert app.__version__ == "0.2.2"
+
+
+def test_status_html_uses_shared_card_layout():
+    payload = build_status(_snapshot(), exporter_up=1, series_count=80)
+    html = render_html(payload)
+    assert "<title>prom_emvue · /status</title>" in html
+    assert "<h1>prom_emvue · /status</h1>" in html
+    for heading in (
+        "Overview",
+        "Error and hint",
+        "Series and process",
+        "Exporter extras",
+        "Hints",
+    ):
+        assert f"<h2>{heading}</h2>" in html
+    assert "<h2>Notes</h2>" not in html
+    assert 'class="UP"' in html
+    assert 'class="banner"' in html
+    assert "font: 15px/1.45 -apple-system" in html
+    assert "color: #0a7a32" in html
+    assert "color: #8a5a00" in html
+    assert "color: #a32020" in html
+    assert "grid-template-columns: 1fr 1fr" in html
+    assert "Casa Main" in html
+    assert "Shop Subpanel" in html
+    assert "<dt>Device count</dt>" in html
+    assert "<dt>Channels</dt>" in html
+    assert "200 OK · devices" in html
+    assert "200 200" not in html
+    assert "while still polling" in html
+    assert "Read-only. This page does not change the exporter." in html
+    assert payload["access_note"] in html
+    assert set(payload) == {
+        "exporter",
+        "version",
+        "build_sha",
+        "mode",
+        "overall",
+        "overall_phrase",
+        "last_success_at",
+        "last_success_pt",
+        "age_seconds",
+        "age_phrase",
+        "poll_interval_s",
+        "next_poll_at",
+        "next_poll_pt",
+        "next_poll_relative",
+        "upstream",
+        "failures",
+        "backoff_s",
+        "backoff",
+        "next_retry_at",
+        "next_retry_pt",
+        "next_retry_relative",
+        "next_retry",
+        "last_error",
+        "hint",
+        "exporter_up",
+        "series_count",
+        "series_stale",
+        "uptime_s",
+        "uptime_phrase",
+        "process_healthy",
+        "process",
+        "extras",
+        "access_note",
+    }
 
 
 def test_json_shape_and_emvue_extras():
@@ -245,7 +312,7 @@ def test_json_shape_and_emvue_extras():
     assert payload["overall"] == "UP"
     assert payload["overall_phrase"] == "UP"
     assert payload["exporter"] == "prom_emvue"
-    assert payload["version"] == "0.2.1"
+    assert payload["version"] == "0.2.2"
     assert payload["mode"] == "Emporia Vue cloud API"
     assert payload["last_success_pt"] == "Oct 27, 2026 10:31:39 PT"
     assert payload["age_phrase"] == "21s ago"
@@ -313,6 +380,9 @@ def test_degraded_next_retry_is_absolute_and_relative():
     assert "last: Casa Main (connected), Shop Subpanel (connected)" in html
     assert "last: 32" in html
     assert "<form" not in html.lower()
+    assert 'class="DEGRADED"' in html
+    assert "<h2>Hints</h2>" in html
+    assert "<h2>Notes</h2>" not in html
 
 
 def test_down_auth_phrase_and_secret_redaction():

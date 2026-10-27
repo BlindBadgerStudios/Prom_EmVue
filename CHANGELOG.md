@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.2 - 2026-10-27
+
+### Changed
+- `GET /status` HTML uses the same sectioned card stylesheet as prom_solark: fonts, colors, `UP` / `DEGRADED` / `DOWN` classes, and the two-column grid.
+- Section headings are Overview, Error and hint, Series and process, Exporter extras, and Hints.
+- The document title is `prom_emvue · /status`.
+- The HTML upstream line no longer repeats a code the message already starts with, so a successful poll shows `200 OK · devices`.
+
+### Unchanged
+- JSON field names on `GET /status?format=json`. Prometheus metric names and `/metrics`.
+
 ## 0.2.1 - 2026-10-27
 
 ### Added
