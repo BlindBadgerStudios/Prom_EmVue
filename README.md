@@ -36,6 +36,14 @@ In either compose file, the exporter service is configured with:
 
 Adjust these values as needed for your deployment environment.
 
+## Operator status
+
+`GET /status` is a read-only HTML page. `GET /status?format=json` returns the same fields (overall `UP` / `DEGRADED` / `DOWN`, last success, poll timing, backoff, `next_retry` in Pacific Time and as a relative phrase, redacted last error, and EmVue device names with connected flags).
+
+Leave Prometheus on `/` or `/metrics`. Metric names are unchanged. Do not scrape `/status`.
+
+On docker3, open `http://127.0.0.1:10110/status` through the lab SSH hop. The page does not include credentials, tokens, account emails, or device coordinates. The state rule is documented in `app/status_rules.py`.
+
 ## Secret scanning
 
 This repo uses a [gitleaks](https://github.com/gitleaks/gitleaks) pre-commit hook. After cloning, run:
